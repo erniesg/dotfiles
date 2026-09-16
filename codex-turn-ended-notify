@@ -1,0 +1,60 @@
+#!/bin/zsh
+
+# Fan out Codex's single notify hook to the desktop turn-ended helper and Discord.
+# Both calls are fail-soft so notification issues never block a Codex session.
+
+set -u
+
+json_arg=""
+for arg in "$@"; do
+  case "$arg" in
+    \{*)
+      json_arg="$arg"
+      break
+      ;;
+  esac
+done
+
+payload_file="$(mktemp -t codex-turn-ended-notify.XXXXXX.json)"
+trap 'rm -f "$payload_file"' EXIT
+
+payload_source="none"
+if [ -n "$json_arg" ]; then
+  printf '%s' "$json_arg" > "$payload_file"
+  payload_source="arg"
+elif [ ! -t 0 ]; then
+  cat > "$payload_file" || true
+  if [ -s "$payload_file" ]; then
+    payload_source="stdin"
+  fi
+fi
+
+computer_use="/Users/erniesg/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"
+discord_notify="/Users/erniesg/.local/bin/agent-discord-notify"
+state_dir="/Users/erniesg/.local/state/agent-discord-notify"
+dry_run="${CODEX_TURN_NOTIFY_DRY_RUN:-${AGENT_DISCORD_NOTIFY_DRY_RUN:-0}}"
+
+if [ "$payload_source" != "none" ]; then
+  mkdir -p "$state_dir" >/dev/null 2>&1 || true
+  cp "$payload_file" "$state_dir/codex-last-payload.json" >/dev/null 2>&1 || true
+fi
+
+if [ -x "$computer_use" ] && [ "$dry_run" != "1" ]; then
+  if [ "$payload_source" = "arg" ]; then
+    "$computer_use" turn-ended "$json_arg" >/dev/null 2>&1 || true
+  elif [ "$payload_source" = "stdin" ]; then
+    "$computer_use" turn-ended < "$payload_file" >/dev/null 2>&1 || true
+  else
+    "$computer_use" turn-ended "$@" >/dev/null 2>&1 || true
+  fi
+fi
+
+if [ -x "$discord_notify" ] && [ "$payload_source" != "none" ]; then
+  notify_args=(--source codex --json-stdin --status done --title "Codex run finished")
+  if [ "$dry_run" = "1" ]; then
+    notify_args+=(--dry-run)
+  fi
+  "$discord_notify" "${notify_args[@]}" < "$payload_file" > "$state_dir/codex-last-notify-output.json" 2>&1 || true
+fi
+
+exit 0

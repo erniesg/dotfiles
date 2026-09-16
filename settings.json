@@ -83,5 +83,17 @@
     "workbench.settings.openDefaultSettings": true,
     "workbench.settings.useSplitJSON": true,
     "workbench.startupEditor": "newUntitledFile",
-    "workbench.panel.defaultLocation": "right",
+    "workbench.sideBar.location": "left",
+    "terminal.integrated.defaultLocation": "bottom",
+    "panel.defaultLocation": "bottom",
+    "workbench.panel.defaultLocation": "bottom",
+    "terminal.integrated.open": true
+    "roo-cline.allowedCommands": [
+      "npm test",
+      "npm install",
+      "tsc",
+      "git log",
+      "git diff",
+      "git show"
+    ],
 }

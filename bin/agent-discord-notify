@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""Send fail-soft Discord notifications for local agent CLIs.
+
+Configuration is intentionally simple:
+  - AGENT_DISCORD_WEBHOOK_URL
+  - CODEX_DISCORD_WEBHOOK_URL
+  - CLAUDE_DISCORD_WEBHOOK_URL
+  - DISCORD_WEBHOOK_URL
+  - DISCORD_WEBHOOK
+
+The same keys may also live in ~/.config/agent-discord-notify.env.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import re
+import socket
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib import error, request
+
+
+SUCCESS_COLOR = 0x57A35B
+INFO_COLOR = 0x4C8FEF
+WARNING_COLOR = 0xF2B84B
+FAILURE_COLOR = 0xD94F45
+
+
+def parse_env_line(line: str) -> tuple[str, str] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return None
+    key, value = stripped.split("=", 1)
+    key = key.strip()
+    value = value.strip().strip('"').strip("'")
+    if not key:
+        return None
+    return key, value
+
+
+def load_env_file(path: Path) -> None:
+    try:
+        content = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        print(f"[agent-discord-notify] could not read {path}: {exc}", file=sys.stderr)
+        return
+
+    for line in content.splitlines():
+        parsed = parse_env_line(line)
+        if not parsed:
+            continue
+        key, value = parsed
+        os.environ.setdefault(key, value)
+
+
+def load_env(cwd: Path) -> None:
+    explicit = os.environ.get("AGENT_DISCORD_ENV_FILE")
+    if explicit:
+        load_env_file(Path(explicit).expanduser())
+
+    load_env_file(Path.home() / ".config" / "agent-discord-notify.env")
+    load_env_file(Path.home() / ".agent-discord-notify.env")
+
+    for name in (".env.local", ".env", ".dev.vars"):
+        load_env_file(cwd / name)
+
+
+def first_env(*keys: str) -> str | None:
+    for key in keys:
+        value = os.environ.get(key)
+        if value:
+            return value
+    return None
+
+
+def resolve_webhook(source: str) -> str | None:
+    source_key = source.upper().replace("-", "_").replace(" ", "_")
+    if source.startswith("codex"):
+        return first_env("CODEX_DISCORD_WEBHOOK_URL", "AGENT_DISCORD_WEBHOOK_URL")
+    if source.startswith("claude"):
+        return first_env("CLAUDE_DISCORD_WEBHOOK_URL", "AGENT_DISCORD_WEBHOOK_URL")
+    return first_env(
+        "AGENT_DISCORD_WEBHOOK_URL",
+        f"{source_key}_DISCORD_WEBHOOK_URL",
+        "CODEX_DISCORD_WEBHOOK_URL",
+        "CLAUDE_DISCORD_WEBHOOK_URL",
+        "DISCORD_WEBHOOK_URL",
+        "DISCORD_WEBHOOK",
+    )
+
+
+def read_hook_json(enabled: bool) -> dict[str, Any]:
+    if not enabled:
+        return {}
+    try:
+        raw = sys.stdin.read()
+    except OSError:
+        return {}
+    if not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"raw_stdin": raw[:400]}
+    return parsed if isinstance(parsed, dict) else {"hook_payload": parsed}
+
+
+def color_for_status(status: str) -> int:
+    normalized = status.lower()
+    if normalized in {"done", "success", "completed", "ok"}:
+        return SUCCESS_COLOR
+    if normalized in {"failed", "failure", "error"}:
+        return FAILURE_COLOR
+    if normalized in {"warning", "warn", "blocked"}:
+        return WARNING_COLOR
+    return INFO_COLOR
+
+
+def field(name: str, value: str, inline: bool = True) -> dict[str, Any]:
+    return {"name": name, "value": value[:1024] or "-", "inline": inline}
+
+
+def content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return ""
+
+
+def jsonish_to_text(value: Any) -> str:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return ""
+        if stripped[0] in "{[":
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                return stripped
+            parsed_text = jsonish_to_text(parsed)
+            return parsed_text or stripped
+        return stripped
+
+    if isinstance(value, list):
+        text = content_to_text(value).strip()
+        if text:
+            return text
+        parts = [jsonish_to_text(item) for item in value]
+        return "\n".join(part for part in parts if part)
+
+    if isinstance(value, dict):
+        content = content_to_text(value.get("content")).strip()
+        if content:
+            return content
+
+        title = jsonish_to_text(value.get("title"))
+        for key in ("summary", "text", "message", "response", "final", "body"):
+            text = jsonish_to_text(value.get(key))
+            if text:
+                return f"{title}\n{text}" if title and title != text else text
+        if title:
+            return f"Task: {title}"
+
+    return ""
+
+
+def last_assistant_text_from_transcript(path_value: Any) -> str:
+    if not isinstance(path_value, str) or not path_value:
+        return ""
+    path = Path(path_value).expanduser()
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+
+    last_text = ""
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        message = event.get("message") if isinstance(event, dict) else None
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        text = content_to_text(message.get("content")).strip()
+        if text:
+            last_text = text
+    return last_text
+
+
+def clean_lines(text: str) -> list[str]:
+    lines: list[str] = []
+    in_fence = False
+    for raw in text.replace("\r\n", "\n").splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence or not stripped:
+            continue
+        stripped = re.sub(r"^[-*]\s+", "- ", stripped)
+        lines.append(stripped)
+    return lines
+
+
+def summarize_text(text: str, max_chars: int = 1800) -> str:
+    lines = clean_lines(text)
+    if not lines:
+        return ""
+    if len(lines) == 1:
+        return lines[0][:max_chars]
+
+    validation_terms = re.compile(
+        r"\b(test|tests|tested|validation|validated|verified|verify|build|typecheck|lint|"
+        r"passed|failed|failure|error|blocked|caveat|gotcha|next|todo|follow[- ]?up|"
+        r"npm|pnpm|pytest|vitest|playwright|curl|HTTP\s+\d{3})\b",
+        re.IGNORECASE,
+    )
+
+    recap: list[str] = []
+    validations: list[str] = []
+    for line in lines:
+        target = validations if validation_terms.search(line) else recap
+        if len(target) < 5:
+            target.append(line)
+
+    chunks: list[str] = []
+    if recap:
+        chunks.append("**Recap**")
+        chunks.extend(recap[:5])
+    if validations:
+        chunks.append("")
+        chunks.append("**Validation / Caveats / Next**")
+        chunks.extend(validations[:5])
+    if not chunks:
+        chunks = ["**Recap**", *lines[:5]]
+
+    summary = "\n".join(chunks)
+    if len(summary) > max_chars:
+        summary = summary[: max_chars - 1].rstrip() + "…"
+    return summary
+
+
+def auto_summary(args: argparse.Namespace, hook_payload: dict[str, Any], cwd: Path) -> str:
+    if args.summary:
+        return args.summary
+
+    codex_text = jsonish_to_text(
+        hook_payload.get("last-assistant-message")
+        or hook_payload.get("last_assistant_message")
+        or hook_payload.get("message")
+    )
+    if codex_text:
+        summary = summarize_text(codex_text)
+        if summary:
+            return summary
+
+    claude_text = last_assistant_text_from_transcript(hook_payload.get("transcript_path"))
+    if claude_text:
+        summary = summarize_text(claude_text)
+        if summary:
+            return summary
+
+    hook_event = hook_payload.get("hook_event_name") or hook_payload.get("event") or hook_payload.get("type")
+    if hook_event:
+        return f"Hook event: {hook_event}"
+    return f"Finished in `{cwd}`"
+
+
+def is_test_payload(hook_payload: dict[str, Any]) -> bool:
+    client = str(hook_payload.get("client") or "").strip().lower()
+    if client == "codex test":
+        return True
+
+    thread_id = str(hook_payload.get("thread-id") or hook_payload.get("thread_id") or "")
+    if thread_id in {"thread-1", "thread-2", "stdin-thread", "arg-thread"}:
+        return True
+
+    text = jsonish_to_text(hook_payload.get("last-assistant-message") or "").lower()
+    return text.startswith("wrapper stdin") or text.startswith("wrapper argv")
+
+
+def is_codex_title_generation_payload(hook_payload: dict[str, Any]) -> bool:
+    input_messages = hook_payload.get("input-messages") or hook_payload.get("input_messages") or []
+    if isinstance(input_messages, list):
+        input_text = "\n".join(str(message) for message in input_messages)
+    else:
+        input_text = str(input_messages)
+
+    title_prompt_markers = (
+        "provide a short title for a task",
+        "Generate a concise UI title",
+        "User prompt:",
+    )
+    if all(marker in input_text for marker in title_prompt_markers):
+        return True
+
+    raw_assistant = hook_payload.get("last-assistant-message") or hook_payload.get("last_assistant_message")
+    if not isinstance(raw_assistant, str) or not raw_assistant.strip().startswith("{"):
+        return False
+    try:
+        parsed = json.loads(raw_assistant)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(parsed, dict) and set(parsed) == {"title"} and isinstance(parsed.get("title"), str)
+
+
+def build_payload(args: argparse.Namespace, hook_payload: dict[str, Any]) -> dict[str, Any]:
+    cwd = Path(args.cwd or hook_payload.get("cwd") or os.getcwd()).expanduser()
+    source = args.source
+    status = args.status
+    title = args.title or f"{source} run {status}"
+    hook_event = hook_payload.get("hook_event_name") or hook_payload.get("event")
+    summary = auto_summary(args, hook_payload, cwd)
+
+    fields = [
+        field("Source", source),
+        field("Status", status),
+        field("Host", socket.gethostname()),
+        field("CWD", str(cwd), inline=False),
+    ]
+
+    client = hook_payload.get("client")
+    thread_id = hook_payload.get("thread-id") or hook_payload.get("thread_id")
+    turn_id = hook_payload.get("turn-id") or hook_payload.get("turn_id")
+    session_id = hook_payload.get("session_id")
+    transcript_path = hook_payload.get("transcript_path")
+    if client:
+        fields.append(field("Client", str(client)))
+    if thread_id:
+        fields.append(field("Thread", str(thread_id), inline=False))
+    if turn_id:
+        fields.append(field("Turn", str(turn_id), inline=False))
+    if hook_event:
+        fields.append(field("Hook", str(hook_event)))
+    if session_id:
+        fields.append(field("Session", str(session_id), inline=False))
+    if transcript_path:
+        fields.append(field("Transcript", str(transcript_path), inline=False))
+
+    footer = f"{platform.system()} {platform.release()} · agent-discord-notify"
+    embed = {
+        "title": title[:256],
+        "description": summary[:4096],
+        "color": color_for_status(status),
+        "fields": fields[:25],
+        "footer": {"text": footer[:2048]},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    mention = args.mention or os.environ.get("AGENT_DISCORD_MENTION", "")
+    content = mention.strip()
+
+    username = args.username or os.environ.get("AGENT_DISCORD_USERNAME", "Agent Notifier")
+    payload: dict[str, Any] = {
+        "content": content,
+        "username": username[:80],
+        "embeds": [embed],
+    }
+    return payload
+
+
+def post_webhook(webhook_url: str, payload: dict[str, Any]) -> tuple[bool, str]:
+    data = json.dumps(payload).encode("utf-8")
+    req = request.Request(
+        webhook_url,
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "agent-discord-notify/1.0",
+        },
+    )
+    try:
+        with request.urlopen(req, timeout=10) as resp:
+            if 200 <= resp.status < 300:
+                return True, f"posted ({resp.status})"
+            return False, f"webhook returned HTTP {resp.status}"
+    except error.HTTPError as exc:
+        return False, f"webhook returned HTTP {exc.code}"
+    except Exception as exc:  # noqa: BLE001 - hook must never block the agent.
+        return False, f"webhook post failed: {exc}"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Send a Discord agent notification.")
+    parser.add_argument("--source", default="agent", help="codex, codex-cli, claude-code, etc.")
+    parser.add_argument("--status", default="done", help="done, failed, blocked, info, etc.")
+    parser.add_argument("--title", default="", help="Discord embed title.")
+    parser.add_argument("--summary", default="", help="Discord embed summary.")
+    parser.add_argument("--cwd", default="", help="Working directory to report.")
+    parser.add_argument("--mention", default="", help="Optional Discord mention content.")
+    parser.add_argument("--username", default="", help="Optional webhook username override.")
+    parser.add_argument("--webhook-url", default="", help="Webhook URL override.")
+    parser.add_argument("--json-stdin", action="store_true", help="Read hook JSON from stdin.")
+    parser.add_argument("--dry-run", action="store_true", help="Print sanitized payload only.")
+    args = parser.parse_args()
+
+    hook_payload = read_hook_json(args.json_stdin)
+    cwd = Path(args.cwd or hook_payload.get("cwd") or os.getcwd()).expanduser()
+    load_env(cwd)
+
+    if args.source.startswith("codex") and is_test_payload(hook_payload):
+        print("[agent-discord-notify] skipped Codex test payload", file=sys.stderr)
+        return 0
+    if args.source.startswith("codex") and is_codex_title_generation_payload(hook_payload):
+        print("[agent-discord-notify] skipped Codex title-generation payload", file=sys.stderr)
+        return 0
+
+    payload = build_payload(args, hook_payload)
+    if args.dry_run:
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    webhook_url = args.webhook_url or resolve_webhook(args.source)
+    if not webhook_url:
+        print("[agent-discord-notify] no Discord webhook configured; skipped", file=sys.stderr)
+        return 0
+
+    ok, message = post_webhook(webhook_url, payload)
+    print(f"[agent-discord-notify] {message}", file=sys.stderr)
+    return 0 if ok else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,4 @@
+# Keep Codex Desktop/CLI turn-ended notifications fanned out to both:
+# - Codex Computer Use turn-ended handling
+# - Discord "Codex run finished" webhook pings
+notify = ["/Users/erniesg/.local/bin/codex-turn-ended-notify"]
