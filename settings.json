@@ -87,7 +87,7 @@
     "terminal.integrated.defaultLocation": "bottom",
     "panel.defaultLocation": "bottom",
     "workbench.panel.defaultLocation": "bottom",
-    "terminal.integrated.open": true
+    "terminal.integrated.open": true,
     "roo-cline.allowedCommands": [
       "npm test",
       "npm install",
